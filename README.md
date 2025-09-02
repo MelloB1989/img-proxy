@@ -5,6 +5,8 @@ A secure, high-performance image proxy service built with Hono and deployed on C
 ## 🚀 Features
 
 - **Secure Host Allowlisting**: Only proxy images from pre-approved domains
+- **Temporary Image Upload**: Upload images with configurable expiration times (up to 5 hours)
+- **Automatic Cleanup**: Scheduled cleanup of expired temporary images
 - **CORS Support**: Proper cross-origin resource sharing headers
 - **Edge Caching**: Leverages Cloudflare's global CDN for fast image delivery
 - **Content Validation**: Ensures only image content is proxied
@@ -38,13 +40,31 @@ npm install -g wrangler
    wrangler login
    ```
 
-3. **Update Configuration**
+3. **Setup R2 Bucket (for temporary uploads)**
 
-   Edit `wrangler.toml`:
-   ```toml
-   name = "your-image-proxy-name"
-   main = "src/index.ts"
-   compatibility_date = "2024-01-01"
+   Create an R2 bucket for temporary image storage:
+   ```bash
+   wrangler r2 bucket create temp-images
+   ```
+
+4. **Update Configuration**
+
+   The `wrangler.jsonc` is already configured with the R2 bucket binding:
+   ```json
+   {
+     "name": "image-proxy",
+     "main": "src/index.ts",
+     "compatibility_date": "2025-08-16",
+     "r2_buckets": [
+       {
+         "binding": "TEMP_IMAGES",
+         "bucket_name": "temp-images"
+       }
+     ],
+     "triggers": {
+       "crons": ["0 */1 * * *"]
+     }
+   }
    ```
 
 ## 🚦 Development
@@ -80,6 +100,7 @@ Health check and service information.
   "version": "1.0.0",
   "endpoints": {
     "proxy": "/img?url=<encoded-image-url>",
+    "tempUpload": "/api/temp-upload",
     "health": "/"
   }
 }
@@ -124,9 +145,112 @@ Get image headers without downloading the content.
 
 Same parameters and responses as GET, but returns only headers.
 
+#### `POST /api/temp-upload`
+Upload an image temporarily with configurable expiration time.
+
+**Parameters:**
+- `image` (required): Image file to upload (multipart/form-data)
+- `duration` (required): Duration in hours (0 < duration ≤ 5)
+
+**Supported File Types:**
+- image/jpeg, image/jpg
+- image/png  
+- image/gif
+- image/webp
+- image/bmp
+- image/svg+xml
+
+**File Size Limit:** 10MB
+
+**Example:**
+```bash
+curl -X POST \
+  -F "image=@my-image.jpg" \
+  -F "duration=2.5" \
+  https://your-worker.workers.dev/api/temp-upload
+```
+
+**Success Response:**
+```json
+{
+  "success": true,
+  "key": "temp-1625097600000-abc123def456",
+  "url": "/api/temp-image/temp-1625097600000-abc123def456",
+  "expiresAt": "2025-09-02T21:30:00.000Z",
+  "durationHours": 2.5,
+  "originalName": "my-image.jpg",
+  "size": 1048576,
+  "type": "image/jpeg"
+}
+```
+
+**Error Responses:**
+
+- **400 Bad Request**: Missing or invalid parameters
+  ```json
+  {
+    "error": "Missing 'image' file in form data"
+  }
+  ```
+
+- **400 Bad Request**: Invalid duration
+  ```json
+  {
+    "error": "Invalid hosting duration: 6 hours. Must be between 0 and 5 hours"
+  }
+  ```
+
+- **400 Bad Request**: Invalid file type
+  ```json
+  {
+    "error": "Invalid file type: text/plain. Allowed types: image/jpeg, image/jpg, image/png, image/gif, image/webp, image/bmp, image/svg+xml"
+  }
+  ```
+
+- **400 Bad Request**: File too large
+  ```json
+  {
+    "error": "File too large: 15728640 bytes. Maximum allowed: 10485760 bytes (10MB)"
+  }
+  ```
+
+#### `GET /api/temp-image/:key`
+Retrieve a temporarily uploaded image.
+
+**Parameters:**
+- `key` (required): Unique key returned from upload
+
+**Example:**
+```bash
+curl "https://your-worker.workers.dev/api/temp-image/temp-1625097600000-abc123def456"
+```
+
+**Response Headers:**
+- `Content-Type`: Image content type
+- `Content-Length`: File size
+- `Cache-Control`: `public, max-age=300`
+- `Content-Disposition`: `inline`
+- `Access-Control-Allow-Origin`: `*`
+
+**Error Responses:**
+
+- **404 Not Found**: Image not found
+  ```json
+  {
+    "error": "Image not found or expired"
+  }
+  ```
+
+- **410 Gone**: Image has expired
+  ```json
+  {
+    "error": "Image has expired"
+  }
+  ```
+
 ## 🛠️ Usage Examples
 
-### JavaScript/TypeScript
+### Image Proxying
 
 ```javascript
 // Basic usage
@@ -154,6 +278,123 @@ const ImageProxy = ({ src, alt, ...props }) => {
 };
 ```
 
+### Temporary Image Upload
+
+```javascript
+// Upload a temporary image
+async function uploadTempImage(file, durationHours) {
+  const formData = new FormData();
+  formData.append('image', file);
+  formData.append('duration', durationHours.toString());
+
+  const response = await fetch('https://your-worker.workers.dev/api/temp-upload', {
+    method: 'POST',
+    body: formData
+  });
+
+  const result = await response.json();
+  
+  if (result.success) {
+    console.log('Upload successful:', result);
+    console.log('Image URL:', `https://your-worker.workers.dev${result.url}`);
+    console.log('Expires at:', result.expiresAt);
+    return result;
+  } else {
+    console.error('Upload failed:', result.error);
+    throw new Error(result.error);
+  }
+}
+
+// Example usage
+const fileInput = document.getElementById('file-input');
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (file) {
+    try {
+      const result = await uploadTempImage(file, 2); // 2 hours
+      // Use result.url to display the image
+    } catch (error) {
+      console.error('Error:', error.message);
+    }
+  }
+});
+```
+
+### React Hook for Temporary Upload
+
+```javascript
+import { useState } from 'react';
+
+function useTempImageUpload() {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const uploadImage = async (file, duration) => {
+    setUploading(true);
+    setError(null);
+    
+    try {
+      const formData = new FormData();
+      formData.append('image', file);
+      formData.append('duration', duration.toString());
+
+      const response = await fetch('/api/temp-upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      const result = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(result.error);
+      }
+      
+      return result;
+    } catch (err) {
+      setError(err.message);
+      throw err;
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return { uploadImage, uploading, error };
+}
+
+// Usage in component
+function ImageUploader() {
+  const { uploadImage, uploading, error } = useTempImageUpload();
+  const [result, setResult] = useState(null);
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      try {
+        const uploadResult = await uploadImage(file, 1); // 1 hour
+        setResult(uploadResult);
+      } catch (error) {
+        console.error('Upload failed:', error);
+      }
+    }
+  };
+
+  return (
+    <div>
+      <input type="file" accept="image/*" onChange={handleUpload} />
+      {uploading && <p>Uploading...</p>}
+      {error && <p>Error: {error}</p>}
+      {result && (
+        <div>
+          <p>Upload successful!</p>
+          <img src={result.url} alt="Uploaded" />
+          <p>Expires: {new Date(result.expiresAt).toLocaleString()}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
 ### HTML
 
 ```html
@@ -175,6 +416,16 @@ curl "https://your-worker.workers.dev/img?url=https%3A//media.licdn.com/dms/imag
 
 # Get image headers only
 curl -I "https://your-worker.workers.dev/img?url=https%3A//media.licdn.com/dms/image/example.jpg"
+
+# Upload temporary image
+curl -X POST \
+  -F "image=@my-photo.jpg" \
+  -F "duration=3" \
+  https://your-worker.workers.dev/api/temp-upload
+
+# Download temporary image
+curl "https://your-worker.workers.dev/api/temp-image/temp-1625097600000-abc123def456" \
+  -o downloaded-image.jpg
 
 # Health check
 curl https://your-worker.workers.dev/
@@ -284,17 +535,43 @@ npm test
 # Test health endpoint
 curl https://your-worker.workers.dev/
 
-# Test valid image
+# Test valid image proxy
 curl "https://your-worker.workers.dev/img?url=https%3A//media.licdn.com/dms/image/test.jpg"
 
-# Test invalid host
-curl "https://your-worker.workers.dev/img?url=https%3A//evil.com/image.jpg"
-
-# Test HEAD request
+# Test HEAD request for image proxy
 curl -I "https://your-worker.workers.dev/img?url=https%3A//media.licdn.com/dms/image/test.jpg"
+
+# Test temporary image upload
+curl -X POST \
+  -F "image=@test-image.png" \
+  -F "duration=1" \
+  https://your-worker.workers.dev/api/temp-upload
+
+# Test serving temporary image (use key from upload response)
+curl "https://your-worker.workers.dev/api/temp-image/temp-1234567890-abcdef"
+
+# Test error cases
+curl -X POST \
+  -F "image=@test-image.png" \
+  -F "duration=6" \
+  https://your-worker.workers.dev/api/temp-upload  # Should fail (>5 hours)
+
+curl -X POST \
+  -F "duration=1" \
+  https://your-worker.workers.dev/api/temp-upload  # Should fail (missing image)
 ```
 
 ## 📝 Changelog
+
+### v2.0.0
+- **NEW**: Temporary image upload API with configurable expiration times
+- **NEW**: Automatic cleanup of expired images via scheduled cron job
+- **NEW**: Support for multiple image formats (JPEG, PNG, GIF, WebP, BMP, SVG)
+- **NEW**: File size validation (10MB limit)
+- **NEW**: Comprehensive error handling for uploads
+- **NEW**: R2 storage integration for temporary images
+- Enhanced CORS support for POST requests
+- Added logging for uploads and deletions
 
 ### v1.0.0
 - Initial release
