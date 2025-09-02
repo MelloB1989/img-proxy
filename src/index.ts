@@ -2,8 +2,14 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 
 type Bindings = {
-  // Add environment variables here if needed
+  TEMP_IMAGES: R2Bucket;
 };
+
+type ExportedHandlerScheduledHandler = (
+  event: ScheduledEvent,
+  env: Bindings,
+  ctx: ExecutionContext
+) => Promise<void> | void;
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -12,7 +18,7 @@ app.use(
   "*",
   cors({
     origin: "*",
-    allowMethods: ["GET", "HEAD", "OPTIONS"],
+    allowMethods: ["GET", "HEAD", "POST", "OPTIONS"],
     allowHeaders: ["Content-Type", "Authorization"],
   }),
 );
@@ -25,9 +31,193 @@ app.get("/", (c) => {
     version: "1.0.0",
     endpoints: {
       proxy: "/img?url=<encoded-image-url>",
+      tempUpload: "/api/temp-upload",
       health: "/",
     },
   });
+});
+
+// Image validation utilities
+const ALLOWED_IMAGE_TYPES = [
+  "image/jpeg",
+  "image/jpg", 
+  "image/png",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/svg+xml",
+];
+
+const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_HOSTING_HOURS = 5;
+
+function validateImageFile(file: File): { valid: boolean; error?: string } {
+  // Check file type
+  if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+    return {
+      valid: false,
+      error: `Invalid file type: ${file.type}. Allowed types: ${ALLOWED_IMAGE_TYPES.join(", ")}`,
+    };
+  }
+
+  // Check file size
+  if (file.size > MAX_FILE_SIZE) {
+    return {
+      valid: false,
+      error: `File too large: ${file.size} bytes. Maximum allowed: ${MAX_FILE_SIZE} bytes (10MB)`,
+    };
+  }
+
+  return { valid: true };
+}
+
+function validateHostingDuration(hours: number): { valid: boolean; error?: string } {
+  if (hours <= 0 || hours > MAX_HOSTING_HOURS) {
+    return {
+      valid: false,
+      error: `Invalid hosting duration: ${hours} hours. Must be between 0 and ${MAX_HOSTING_HOURS} hours`,
+    };
+  }
+  return { valid: true };
+}
+
+function generateUniqueKey(): string {
+  return `temp-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+}
+
+// Temporary image upload endpoint
+app.post("/api/temp-upload", async (c) => {
+  try {
+    const formData = await c.req.formData();
+    const file = formData.get("image") as File;
+    const durationStr = formData.get("duration") as string;
+
+    if (!file) {
+      return c.json({ error: "Missing 'image' file in form data" }, 400);
+    }
+
+    if (!durationStr) {
+      return c.json({ error: "Missing 'duration' parameter (hours)" }, 400);
+    }
+
+    const duration = parseFloat(durationStr);
+    if (isNaN(duration)) {
+      return c.json({ error: "Invalid 'duration' parameter, must be a number" }, 400);
+    }
+
+    // Validate hosting duration
+    const durationValidation = validateHostingDuration(duration);
+    if (!durationValidation.valid) {
+      return c.json({ error: durationValidation.error }, 400);
+    }
+
+    // Validate image file
+    const fileValidation = validateImageFile(file);
+    if (!fileValidation.valid) {
+      return c.json({ error: fileValidation.error }, 400);
+    }
+
+    // Generate unique key and calculate expiration
+    const key = generateUniqueKey();
+    const expirationTime = new Date(Date.now() + duration * 60 * 60 * 1000);
+
+    // Upload to R2 with metadata
+    const uploadResult = await c.env.TEMP_IMAGES.put(key, file, {
+      httpMetadata: {
+        contentType: file.type,
+        contentDisposition: "inline",
+        cacheControl: "public, max-age=3600",
+      },
+      customMetadata: {
+        originalName: file.name,
+        uploadedAt: new Date().toISOString(),
+        expiresAt: expirationTime.toISOString(),
+        durationHours: duration.toString(),
+      },
+    });
+
+    if (!uploadResult) {
+      console.error("Failed to upload file to R2");
+      return c.json({ error: "Failed to upload image" }, 500);
+    }
+
+    // Log the upload
+    console.log(`Image uploaded: ${key}, expires at: ${expirationTime.toISOString()}`);
+
+    // Return success response
+    const tempUrl = `/api/temp-image/${key}`;
+    return c.json({
+      success: true,
+      key,
+      url: tempUrl,
+      expiresAt: expirationTime.toISOString(),
+      durationHours: duration,
+      originalName: file.name,
+      size: file.size,
+      type: file.type,
+    });
+  } catch (error) {
+    console.error("Error uploading temporary image:", error);
+    return c.json(
+      {
+        error: "Failed to upload image",
+        details: error instanceof Error ? error.message : "Unknown error",
+      },
+      500,
+    );
+  }
+});
+
+// Serve temporary images
+app.get("/api/temp-image/:key", async (c) => {
+  try {
+    const key = c.req.param("key");
+    
+    if (!key) {
+      return c.json({ error: "Missing image key" }, 400);
+    }
+
+    // Get object from R2
+    const object = await c.env.TEMP_IMAGES.get(key);
+    
+    if (!object) {
+      return c.json({ error: "Image not found or expired" }, 404);
+    }
+
+    // Check if image has expired
+    const expiresAt = object.customMetadata?.expiresAt;
+    if (expiresAt && new Date() > new Date(expiresAt)) {
+      // Delete expired image
+      await c.env.TEMP_IMAGES.delete(key);
+      console.log(`Deleted expired image: ${key}`);
+      return c.json({ error: "Image has expired" }, 410);
+    }
+
+    // Return the image
+    const headers = new Headers({
+      "Content-Type": object.httpMetadata?.contentType || "application/octet-stream",
+      "Content-Length": object.size.toString(),
+      "Cache-Control": "public, max-age=300", // 5 minutes cache
+      "Content-Disposition": object.httpMetadata?.contentDisposition || "inline",
+    });
+
+    // Add CORS headers
+    headers.set("Access-Control-Allow-Origin", "*");
+
+    return new Response(object.body, {
+      status: 200,
+      headers,
+    });
+  } catch (error) {
+    console.error("Error serving temporary image:", error);
+    return c.json(
+      {
+        error: "Failed to serve image",
+        details: error instanceof Error ? error.message : "Unknown error",
+      },
+      500,
+    );
+  }
 });
 
 // Image proxy endpoint
@@ -237,5 +427,45 @@ app.onError((err, c) => {
     500,
   );
 });
+
+// Scheduled cleanup job for expired images
+export const scheduled: ExportedHandlerScheduledHandler = async (event, env, ctx) => {
+  console.log("Starting cleanup job for expired images");
+  
+  try {
+    const tempImages = env.TEMP_IMAGES as R2Bucket;
+    let deleted = 0;
+    let errors = 0;
+
+    // List all objects in the bucket
+    const list = await tempImages.list();
+    
+    for (const object of list.objects) {
+      try {
+        // Get the object to check its metadata
+        const objectDetails = await tempImages.head(object.key);
+        
+        if (!objectDetails) {
+          continue;
+        }
+
+        // Check if the image has expired
+        const expiresAt = objectDetails.customMetadata?.expiresAt;
+        if (expiresAt && new Date() > new Date(expiresAt)) {
+          await tempImages.delete(object.key);
+          deleted++;
+          console.log(`Deleted expired image: ${object.key}`);
+        }
+      } catch (error) {
+        errors++;
+        console.error(`Error processing image ${object.key}:`, error);
+      }
+    }
+
+    console.log(`Cleanup job completed. Deleted: ${deleted}, Errors: ${errors}, Total checked: ${list.objects.length}`);
+  } catch (error) {
+    console.error("Error in cleanup job:", error);
+  }
+};
 
 export default app;
