@@ -9,6 +9,15 @@
 	"compatibility_date": "2025-08-16",
 	"observability": {
 		"enabled": true
+	},
+	"r2_buckets": [
+		{
+			"binding": "TEMP_IMAGES",
+			"bucket_name": "temp-images"
+		}
+	],
+	"triggers": {
+		"crons": ["0 */1 * * *"]
 	}
 	/**
 	 * Smart Placement
